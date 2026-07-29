@@ -2000,6 +2000,11 @@ message CrossAppAccessAuth {
   message SubjectToken {
     // Where to read the subject token. Defaults to the Authorization Bearer header.
     AuthorizationLocation source = 1;
+    // RFC 8693 subject token type URI. Allowed values are
+    // "urn:ietf:params:oauth:token-type:id_token" (default) and
+    // "urn:ietf:params:oauth:token-type:access_token".
+    // Empty defaults to id_token for backward compatibility.
+    string token_type = 2;
   }
 
   // User identity provider authorization server, used for the RFC 8693 ID-JAG exchange.
@@ -2014,8 +2019,7 @@ message CrossAppAccessAuth {
   repeated string scopes = 5;
   // Response cache configuration. When unset uses InMemory cache with defaults.
   OAuthTokenExchange.TokenCache cache = 6;
-  // Subject token sent to the identity provider. Its type is fixed to an
-  // OpenID Connect ID token until other subject token types are supported.
+  // Subject token sent to the identity provider.
   SubjectToken subject_token = 7;
 }
 

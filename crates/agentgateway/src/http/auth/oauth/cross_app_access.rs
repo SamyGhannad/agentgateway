@@ -1,16 +1,16 @@
 use std::collections::BTreeMap;
 
+use super::cache::InMemoryTokenCache;
 #[cfg(feature = "schema")]
 use super::TokenCacheConfig;
-use super::cache::InMemoryTokenCache;
 use super::{
-	ChainedExchange, OAuthClientAuth, OAuthGrantType, OAuthTokenExchangeAuth, OAuthTokenType,
-	TokenSpec, default_token_cache, deserialize_token_cache, token_cache_from_proto,
+	default_token_cache, deserialize_token_cache, token_cache_from_proto, ChainedExchange,
+	OAuthClientAuth, OAuthGrantType, OAuthTokenExchangeAuth, OAuthTokenType, TokenSpec,
 };
 use crate::http::auth::AuthorizationLocation;
 use crate::types::agent::SimpleBackendReferenceWithPolicies;
-use crate::types::agent_xds::{Diagnostics, authorization_location, resolve_simple_reference};
-use crate::types::proto::{ProtoError, agent};
+use crate::types::agent_xds::{authorization_location, resolve_simple_reference, Diagnostics};
+use crate::types::proto::{agent, ProtoError};
 use crate::{apply, schema};
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -58,8 +58,8 @@ pub(super) struct CrossAppAccessAuthConfig {
 	/// `scope` values for the requested token, sent space-delimited.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub(super) scopes: Vec<String>,
-	/// Subject token sent to the identity provider. Defaults to an OpenID Connect ID token read
-	/// from the Authorization Bearer header.
+	/// Subject token sent to the identity provider. Defaults to an ID token read from the
+	/// Authorization Bearer header. Set `tokenType` to use an access token subject instead.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub(super) subject_token: Option<CrossAppAccessSubjectToken>,
 	/// Response cache configuration. Defaults to an in-memory cache with 8192 entries and a 300s
@@ -78,6 +78,23 @@ pub(super) struct CrossAppAccessSubjectToken {
 	/// Where to read the subject token. Defaults to the Authorization Bearer header.
 	#[serde(default)]
 	pub(super) source: AuthorizationLocation,
+	/// RFC 8693 subject token type. Allowed values are
+	/// `urn:ietf:params:oauth:token-type:id_token` (default) and
+	/// `urn:ietf:params:oauth:token-type:access_token`.
+	#[serde(
+		default = "default_subject_token_type",
+		skip_serializing_if = "is_default_subject_token_type"
+	)]
+	#[cfg_attr(feature = "schema", schemars(with = "String"))]
+	pub(super) token_type: OAuthTokenType,
+}
+
+fn default_subject_token_type() -> OAuthTokenType {
+	OAuthTokenType::IdToken
+}
+
+fn is_default_subject_token_type(t: &OAuthTokenType) -> bool {
+	*t == OAuthTokenType::IdToken
 }
 
 impl From<CrossAppAccessAuthConfig> for CrossAppAccessAuth {
@@ -99,16 +116,20 @@ impl From<CrossAppAccessAuthConfig> for CrossAppAccessAuth {
 			client_auth,
 		} = identity_provider;
 		let chained_exchange = resource_authorization_server.into_chained_exchange(scopes.clone());
+		let (subject_source, subject_token_type) = match subject_token {
+			Some(CrossAppAccessSubjectToken { source, token_type }) => (source, token_type),
+			None => (
+				AuthorizationLocation::default(),
+				default_subject_token_type(),
+			),
+		};
 		let oauth = OAuthTokenExchangeAuth {
 			target,
 			path,
 			grant_type: OAuthGrantType::TokenExchange,
 			subject_token: TokenSpec {
-				source: match subject_token {
-					Some(CrossAppAccessSubjectToken { source }) => source,
-					None => AuthorizationLocation::default(),
-				},
-				token_type: OAuthTokenType::IdToken,
+				source: subject_source,
+				token_type: subject_token_type,
 			},
 			actor_token: None,
 			audiences: vec![audience],
@@ -129,6 +150,15 @@ impl CrossAppAccessAuth {
 	pub(crate) fn validate_load(&self) -> Result<(), String> {
 		if self.audience().is_empty() {
 			return Err("crossAppAccess audience must not be empty".into());
+		}
+		match &self.oauth.subject_token.token_type {
+			OAuthTokenType::IdToken | OAuthTokenType::AccessToken => {},
+			other => {
+				return Err(format!(
+					"crossAppAccess subject_token.token_type must be id_token or access_token, got {:?}",
+					other.as_str()
+				));
+			},
 		}
 		self.validate_endpoint_paths()?;
 		self.oauth.validate_load()
@@ -189,6 +219,7 @@ impl CrossAppAccessAuth {
 			audience,
 			subject_token: Some(CrossAppAccessSubjectToken {
 				source: self.oauth.subject_token.source.clone(),
+				token_type: self.oauth.subject_token.token_type.clone(),
 			}),
 			resources: self.oauth.resources.clone(),
 			scopes: self.oauth.scopes.clone(),
@@ -229,6 +260,16 @@ impl CrossAppAccessAuth {
 					subject_token.source.as_ref(),
 					AuthorizationLocation::default(),
 				)?,
+				token_type: if subject_token.token_type.is_empty() {
+					default_subject_token_type()
+				} else {
+					OAuthTokenType::from_urn(&subject_token.token_type).ok_or_else(|| {
+						ProtoError::Generic(format!(
+							"unsupported crossAppAccess subject_token.token_type {:?}",
+							subject_token.token_type
+						))
+					})?
+				},
 			}),
 			None => None,
 		};
